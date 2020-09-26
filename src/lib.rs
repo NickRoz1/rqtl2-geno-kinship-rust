@@ -167,10 +167,14 @@ pub mod util {
     /// many products of it's columns by rows, and column can be obtained once
     /// the row is read.
     ///
-    /// This is how Kinship matrix is calculated: read batch from file, copy and
-    /// transpose it, multiply transposed matrix by non transposed, add to
+    /// This is how Kinship matrix can be calculated: read batch from file, copy
+    /// and transpose it, multiply transposed matrix by non transposed, add to
     /// result Kinship matrix. After each batch will be processed and added to
     /// the result Kinship matrix it will contain Kinship matrix.
+    ///
+    /// Actual algorithm does not involve matrix copying and transposing and
+    /// instead just manipulates matrix indices calculation to achieve same
+    /// result.
     ///
     /// Since processing of one batch does not depend on the others, the process
     /// of Kinship matrix can be parallelized: each logical thread gets 2
