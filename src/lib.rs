@@ -147,8 +147,8 @@ pub mod util {
     /// Given a genotype data file stripped to just containing SNPs called G, a
     /// Kinship matrix is a matrix product G.T (transposed) * G.
     ///
-    /// The matrix times it's transpose forms a symmetrical matrix, thus it is
-    /// not needed to calculated the full matrix, just a triangular part of it.
+    /// The matrix times its transpose forms a symmetrical matrix, thus it is
+    /// not needed to calculate the full matrix, just a triangular part of it.
     ///
     /// Matrix multiplication of transposed matrix by itself (or vice versa) can
     /// be performed via addition of non intersecting (1 column with 1 row, 2
@@ -170,29 +170,29 @@ pub mod util {
     /// This is how Kinship matrix can be calculated: read batch from file, copy
     /// and transpose it, multiply transposed matrix by non transposed, add to
     /// result Kinship matrix. After each batch will be processed and added to
-    /// the result Kinship matrix it will contain Kinship matrix.
+    /// the result Kinship matrix it will contain the full Kinship matrix.
     ///
     /// Actual algorithm does not involve matrix copying and transposing and
     /// instead just manipulates matrix indices calculation to achieve same
     /// result.
     ///
     /// Since processing of one batch does not depend on the others, the process
-    /// of Kinship matrix can be parallelized: each logical thread gets 2
-    /// buffer, first one contains read rows, and a second one stores the result
-    /// of batch multiplication, it is done to not block a shared Kinship matrix
-    /// buffer while the calculation is in process. When the thread is spawned,
-    /// it locks the read and result buffer dispatched to him by a main thread
-    /// and then starts the multiplication. Once the multiplication is finished
-    /// and a result buffer contains the part of resulting Kinship matrix, the
-    /// thread locks shared Kinship matrix and merges the results simultaneously
-    /// nullifying result buffer to not interfere with the results calculated by
-    /// the next threads obtaining this buffer, then messaging the main thread
-    /// that the buffer pair on this index is freed.
+    /// of Kinship matrix calculation can be parallelized: each logical thread
+    /// gets 2 buffer, first one contains read rows, and a second one stores the
+    /// result of batch multiplication, it is done to not block a shared Kinship
+    /// matrix buffer while the calculation is in process. When the thread is
+    /// spawned, it locks the read and result buffer dispatched to him by a main
+    /// thread and then starts the multiplication. Once the multiplication is
+    /// finished and a result buffer contains the part of the resulting Kinship
+    /// matrix, the thread locks shared Kinship matrix and merges the results
+    /// simultaneously nullifying result buffer to not interfere with the
+    /// results calculated by the next threads obtaining this buffer, then
+    /// messaging the main thread that the buffer pair on this index is freed.
     ///
     /// Main thread works in a loop: loads data, parses it into a read buffer,
     /// dispatches read/result buffer pair to the thread. If all threads are
-    /// busy performing calculations, it waits until one of them will message a
-    /// freed buffer pair index in the concurrent queue.
+    /// busy performing calculations, it waits until one of them will put a
+    /// freed buffer pair index to the concurrent queue.
     pub fn calc_kinship(&mut self, batch_size: usize) -> std::io::Result<Vec<f64>> {
       if batch_size < 1 {
         panic!("Batch size can't be less than 1.");
@@ -208,6 +208,8 @@ pub mod util {
       let buf_num = num_cpus::get();
       use std::sync::{Arc, Mutex};
 
+      // The compiler can't prove that the buffer ownership won't intersect
+      // (despite it won't intersect), hence the Arc-Mutex is needed.
       let mut read_bufs = Vec::<Arc<Mutex<Vec<f64>>>>::new();
       let mut kinship_bufs = Vec::<Arc<Mutex<Vec<f64>>>>::new();
       for _ in 0..buf_num {
