@@ -235,7 +235,7 @@ pub mod util {
         let read_buf = read_bufs[freed_buffer_idx].clone();
         let kins_buf = kinship_bufs[freed_buffer_idx].clone();
 
-        match Self::fill_buffer(
+        let read_line_amount = match Self::fill_buffer(
           &mut *read_buf.lock().unwrap(),
           &mut line_iter,
           self.markers.len(),
@@ -247,6 +247,14 @@ pub mod util {
             n
           }
         };
+        // Reached EOF (there is not enough records to form a full batch.).
+        // Resize buffer to discard data from previous iterations which was not
+        // overwritten because there is not enough lines to fill the whole
+        // buffer.
+        if read_line_amount < batch_size {
+          let buf = &mut *read_buf.lock().unwrap();
+          buf.resize(read_line_amount * ids_num, 0.0);
+        }
         {
           let (read_buf_arc, kins_buf_arc, res_matrix_arc, kinsh_proc_sender, buf_idx) = (
             read_buf.clone(),
@@ -375,6 +383,15 @@ pub mod util {
     // When the matrix stored in row-major way read in column major way,
     // obtained data is a transpose of this matrix:
     // https://en.wikipedia.org/wiki/Row-_and_column-major_order#Transposition
+    //
+    // Since this is an exact copy of Fortran code, and Fortran utilizes double
+    // index (i,j) to operate over single dimension array (which represents 2D
+    // array), the code below performs index flattening for column-major
+    // storages exactly how Fortran does. Normally, to flatten index in
+    // row-major languages we will multiply row index i by row width and add
+    // column index j, here, since this is a direct copy of Fortran code which
+    // is a colum-major language, we flatten it as column index j *
+    // column height + row index i.
     for j in 0..n {
       for l in 0..k {
         for i in j..n {
