@@ -155,5 +155,23 @@ mod tests {
       *e *= 3.0;
     }
     assert_eq!(matr, expected_kinship_matrix);
+
+    let name = "21487-pheno_geno.txt";
+    let mut path = env::current_dir().unwrap();
+    path.push("src");
+    path.push(name);
+    print!("{:?}", path);
+
+    let f2 = std::fs::OpenOptions::new()
+      .create(true)
+      .write(true)
+      .read(true)
+      .open(&path)
+      .unwrap();
+
+    let mut geno_parser_2 = rqtl2::util::GenoParser::new_with_file(f2, hab_mapper.clone())
+      .expect("Failed to create GenoParser");
+
+    println!("{:?}", geno_parser_2.calc_kinship(1000));
   }
 }

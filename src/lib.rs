@@ -199,44 +199,19 @@ pub mod util {
       }
       let ids_num = self.markers.len();
       // Kinship matrix is square.
-      let common_kinship_matrix: Arc<Mutex<Vec<f64>>> =
-        Arc::new(Mutex::new(vec![0.0; ids_num * ids_num]));
+      let mut common_kinship_matrix: Vec<f64> = vec![0.0; ids_num * ids_num];
 
       // This amount of snps will be parsed and processed on each iteration.
       let buf_size = ids_num * batch_size;
-      // For each physical thread a buffer will be created.
-      let buf_num = num_cpus::get();
-      use std::sync::{Arc, Mutex};
 
-      // The compiler can't prove that the buffer ownership won't intersect
-      // (despite it won't intersect), hence the Arc-Mutex is needed.
-      let mut read_bufs = Vec::<Arc<Mutex<Vec<f64>>>>::new();
-      let mut kinship_bufs = Vec::<Arc<Mutex<Vec<f64>>>>::new();
-      for _ in 0..buf_num {
-        read_bufs.push(Arc::new(Mutex::new(vec![0.0; buf_size])));
-        kinship_bufs.push(Arc::new(Mutex::new(vec![0.0; ids_num * ids_num])));
-      }
+      let mut read_buf: Vec<f64> = vec![0.0; buf_size];
 
-      use std::sync::mpsc::channel;
-      use std::thread;
-      let (kinship_processor, buffer_filler) = channel::<usize>();
-      // Fill the concurrent queue with the buffers numbers, so the buffer
-      // filler can start parsing into them.
-      for buf_idx in 0..buf_num {
-        kinship_processor.send(buf_idx).unwrap();
-      }
-      let mut threads = Vec::<thread::JoinHandle<()>>::new();
       let file_reader = self.file_reader.get_mut();
       let mut line_iter = BufReader::new(file_reader).lines();
       let mut total_snps_read: usize = 0;
       loop {
-        // Get freed buffer index.
-        let freed_buffer_idx = buffer_filler.recv().unwrap();
-        let read_buf = read_bufs[freed_buffer_idx].clone();
-        let kins_buf = kinship_bufs[freed_buffer_idx].clone();
-
-        match Self::fill_buffer(
-          &mut *read_buf.lock().unwrap(),
+        let read_line_amount = match Self::fill_buffer(
+          &mut read_buf,
           &mut line_iter,
           self.markers.len(),
           self.hab_mapper.clone(),
@@ -247,29 +222,11 @@ pub mod util {
             n
           }
         };
-        {
-          let (read_buf_arc, kins_buf_arc, res_matrix_arc, kinsh_proc_sender, buf_idx) = (
-            read_buf.clone(),
-            kins_buf.clone(),
-            common_kinship_matrix.clone(),
-            kinship_processor.clone(),
-            freed_buffer_idx.clone(),
-          );
-
-          threads.push(std::thread::spawn(move || {
-            let mut threads_read_buf = read_buf_arc.lock().unwrap();
-            let mut threads_kins_buf = kins_buf_arc.lock().unwrap();
-            calc_partial_kinship(&mut threads_read_buf, &mut threads_kins_buf, ids_num);
-            let mut res_matrix = res_matrix_arc.lock().unwrap();
-            for (buf_elem, common_matrix_elem) in
-              threads_kins_buf.iter_mut().zip(res_matrix.iter_mut())
-            {
-              *common_matrix_elem += *buf_elem;
-              *buf_elem = 0.0;
-            }
-            kinsh_proc_sender.send(buf_idx).unwrap();
-          }));
+        if read_line_amount < ids_num {
+          let buf = &mut read_buf;
+          buf.resize(ids_num * ids_num, 0.0);
         }
+        calc_partial_kinship(&mut read_buf, &mut common_kinship_matrix, ids_num);
       }
 
       assert!(
@@ -282,18 +239,9 @@ pub mod util {
         )
       );
 
-      threads.into_iter().for_each(|thread| {
-        thread
-          .join()
-          .expect("The thread creating or execution failed !")
-      });
-
       self.file_reader.seek(SeekFrom::Start(self.snp_pos_start))?;
 
-      let mut res = Arc::try_unwrap(common_kinship_matrix)
-        .expect("Arc uwrapping failed. Kinship matrix is not accessible.")
-        .into_inner()
-        .expect("Mutex uwrapping failed. Kinship matrix is not accessible.");
+      let mut res = common_kinship_matrix;
 
       // Mirror Kinship matrix, since only the upper part was calculated (the
       // Kinship matrix is symmetrical because it's formed from it's transpose times itself).
@@ -356,8 +304,6 @@ pub mod util {
     partial_matrix: &mut Vec<f64>,
     ids_num: usize,
   ) -> () {
-    let n = ids_num;
-    let k = snps.len() / n;
     // Algorithm from BLAS dsyrk:
     // http://www.netlib.org/lapack/explore-html/d1/d54/group__double__blas__level3_gae0ba56279ae3fa27c75fefbc4cc73ddf.html#gae0ba56279ae3fa27c75fefbc4cc73ddf
     //
@@ -375,12 +321,33 @@ pub mod util {
     // When the matrix stored in row-major way read in column major way,
     // obtained data is a transpose of this matrix:
     // https://en.wikipedia.org/wiki/Row-_and_column-major_order#Transposition
-    for j in 0..n {
-      for l in 0..k {
-        for i in j..n {
-          partial_matrix[j * ids_num + i] += snps[l * ids_num + j] * snps[l * ids_num + i];
-        }
-      }
+    extern crate cblas;
+    extern crate openblas_src;
+
+    let n = ids_num;
+    let k = snps.len() / n;
+    println!(
+      "N = {:?}\nK = {:?}\nRES_MATR_SIZE = {}\nSNPS_SIZE = {}",
+      n,
+      k,
+      partial_matrix.len(),
+      snps.len()
+    );
+    // Only the upper triangular part of matrix will be calculated.
+    unsafe {
+      cblas::dsyrk(
+        cblas::Layout::RowMajor,
+        cblas::Part::Upper,
+        cblas::Transpose::Ordinary,
+        n as i32,
+        k as i32,
+        1.0,
+        &snps[..],
+        k as i32,
+        1.0,
+        &mut partial_matrix[..],
+        n as i32,
+      );
     }
   }
 
