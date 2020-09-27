@@ -64,7 +64,7 @@ pub mod util {
 
     /// @brief Get comments from genotype file.
     pub fn get_comments(&self) -> &Vec<String> {
-      &self.markers
+      &self.comments
     }
 
     /// @brief Returns vector of tuples (id, snps) parsed from file.
