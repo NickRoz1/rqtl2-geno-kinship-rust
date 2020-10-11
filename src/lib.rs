@@ -280,6 +280,7 @@ pub mod util {
           self.markers.len(),
           self.hab_mapper.clone(),
         )? {
+          // Continue consuming work unit queue till every thread is finished.
           0 => continue,
           n => {
             total_snps_read += n;
