@@ -178,70 +178,109 @@ pub mod util {
     ///
     /// Since processing of one batch does not depend on the others, the process
     /// of Kinship matrix calculation can be parallelized: each logical thread
-    /// gets 2 buffer, first one contains read rows, and a second one stores the
+    /// gets 2 buffers, first one contains read rows, and a second one stores the
     /// result of batch multiplication, it is done to not block a shared Kinship
-    /// matrix buffer while the calculation is in process. When the thread is
-    /// spawned, it locks the read and result buffer dispatched to him by a main
-    /// thread and then starts the multiplication. Once the multiplication is
-    /// finished and a result buffer contains the part of the resulting Kinship
-    /// matrix, the thread locks shared Kinship matrix and merges the results
-    /// simultaneously nullifying result buffer to not interfere with the
-    /// results calculated by the next threads obtaining this buffer, then
-    /// messaging the main thread that the buffer pair on this index is freed.
+    /// matrix buffer while the calculation is in process.
+    //
+    /// Main thread has several channels connecting him to each work thread,
+    /// this is done to emulate threadpool. Threads connected to the main thread
+    /// via mpsc queue (which is also implemented via channels). Notice, that
+    /// each thread connected to the main thread with two channels.
     ///
-    /// Main thread works in a loop: loads data, parses it into a read buffer,
-    /// dispatches read/result buffer pair to the thread. If all threads are
-    /// busy performing calculations, it waits until one of them will put a
-    /// freed buffer pair index to the concurrent queue.
+    /// The MAIN -> WORKER channel messages a work unit to the worker thread
+    /// from the main thread (dispatches work, just like a threadpool
+    /// implementation would). WORKER -> MAIN channel messages work unit
+    /// (processed) back to the main thread, where it gets merged into the
+    /// common kinship matrix. The WorkUnit contains the sender field, which
+    /// contains a channel sender. This way the main threads knows which thread
+    /// completed its work and can be loaded with the new batch (dispatched
+    /// through this sender).
+    ///
+    /// When the main thread hits EOF in the geno file, it starts dropping work
+    /// units. When the work unit is dropped, the unique sender inside it
+    /// associated with particular thread is also dropped. When the unique
+    /// sender is dropped, the consumer calling recv errors. In a thread, it
+    /// causes it to stop waiting for new tasks and terminate. Once all worker
+    /// threads finished executing, there is no more senders for the main thread
+    /// consumer (which receives, merges and dispatches the work units). This
+    /// causes recv to error, terminating the dispatching loop, finishing the
+    /// geno file processing.
     pub fn calc_kinship(&mut self, batch_size: usize) -> std::io::Result<Vec<f64>> {
       if batch_size < 1 {
         panic!("Batch size can't be less than 1.");
       }
       let ids_num = self.markers.len();
       // Kinship matrix is square.
-      let common_kinship_matrix: Arc<Mutex<Vec<f64>>> =
-        Arc::new(Mutex::new(vec![0.0; ids_num * ids_num]));
+      let mut common_kinship_matrix: Vec<f64> = vec![0.0; ids_num * ids_num];
 
       // This amount of snps will be parsed and processed on each iteration.
       let buf_size = ids_num * batch_size;
-      // For each physical thread a buffer will be created.
+      // For each physical thread a buffers will be created.
       let buf_num = num_cpus::get();
-      use std::sync::{Arc, Mutex};
 
-      // The compiler can't prove that the buffer ownership won't intersect
-      // (despite it won't intersect), hence the Arc-Mutex is needed.
-      let mut read_bufs = Vec::<Arc<Mutex<Vec<f64>>>>::new();
-      let mut kinship_bufs = Vec::<Arc<Mutex<Vec<f64>>>>::new();
-      for _ in 0..buf_num {
-        read_bufs.push(Arc::new(Mutex::new(vec![0.0; buf_size])));
-        kinship_bufs.push(Arc::new(Mutex::new(vec![0.0; ids_num * ids_num])));
+      // One unit of work, gets dispatched to a thread.
+      struct WorkUnit {
+        sender: std::sync::mpsc::Sender<WorkUnit>,
+        input_buf: Vec<f64>,
+        result_buf: Vec<f64>,
       }
 
       use std::sync::mpsc::channel;
       use std::thread;
-      let (kinship_processor, buffer_filler) = channel::<usize>();
-      // Fill the concurrent queue with the buffers numbers, so the buffer
-      // filler can start parsing into them.
-      for buf_idx in 0..buf_num {
-        kinship_processor.send(buf_idx).unwrap();
-      }
+
+      // Channel which returns results of calculation to the main thread
+      // to merge them with the end Kinship matrix.
+      let (worker_thread_sender, main_thread_consumer) = channel::<WorkUnit>();
+
       let mut threads = Vec::<thread::JoinHandle<()>>::new();
+
+      for _ in 0..buf_num {
+        // Channel which sends work unit to the worker thread for processing.
+        let (main_thread_sender, worker_thread_consumer) = channel::<WorkUnit>();
+        let worker_thread_sender_clone = worker_thread_sender.clone();
+        // Prefill the queue.
+        let work_unit = WorkUnit {
+          sender: main_thread_sender,
+          input_buf: vec![0.0; buf_size],
+          result_buf: vec![0.0; ids_num * ids_num],
+        };
+        worker_thread_sender.send(work_unit).unwrap();
+        threads.push(std::thread::spawn(move || {
+          while let Ok(mut work_unit) = worker_thread_consumer.recv() {
+            calc_partial_kinship(&work_unit.input_buf, &mut work_unit.result_buf, ids_num);
+            worker_thread_sender_clone.send(work_unit).unwrap();
+          }
+          // Worker thread terminates.
+        }));
+      }
+
+      // Drop worker thread sender, so the main thread consumer automatically
+      // terminates when the threads are destroyed (when threads are destroyed,
+      // there no more senders, so the consumer fails on recv call.)
+      drop(worker_thread_sender);
+
       let file_reader = self.file_reader.get_mut();
       let mut line_iter = BufReader::new(file_reader).lines();
       let mut total_snps_read: usize = 0;
-      loop {
-        // Get freed buffer index.
-        let freed_buffer_idx = buffer_filler.recv().unwrap();
-        let read_buf = read_bufs[freed_buffer_idx].clone();
-        let kins_buf = kinship_bufs[freed_buffer_idx].clone();
 
-        let read_line_amount = match Self::fill_buffer(
-          &mut *read_buf.lock().unwrap(),
+      while let Ok(mut work_unit) = main_thread_consumer.recv() {
+        // Merge results and restore result buffer.
+        for (buf_elem, common_matrix_elem) in work_unit
+          .result_buf
+          .iter_mut()
+          .zip(common_kinship_matrix.iter_mut())
+        {
+          *common_matrix_elem += *buf_elem;
+          *buf_elem = 0.0;
+        }
+        // Parse new batch (load work unit).
+        let line_count = match Self::fill_buffer(
+          &mut work_unit.input_buf,
           &mut line_iter,
           self.markers.len(),
           self.hab_mapper.clone(),
         )? {
-          0 => break,
+          0 => continue,
           n => {
             total_snps_read += n;
             n
@@ -251,33 +290,12 @@ pub mod util {
         // Resize buffer to discard data from previous iterations which was not
         // overwritten because there is not enough lines to fill the whole
         // buffer.
-        if read_line_amount < batch_size {
-          let buf = &mut *read_buf.lock().unwrap();
-          buf.resize(read_line_amount * ids_num, 0.0);
+        if line_count < batch_size {
+          work_unit.input_buf.resize(line_count * ids_num, 0.0);
         }
-        {
-          let (read_buf_arc, kins_buf_arc, res_matrix_arc, kinsh_proc_sender, buf_idx) = (
-            read_buf.clone(),
-            kins_buf.clone(),
-            common_kinship_matrix.clone(),
-            kinship_processor.clone(),
-            freed_buffer_idx.clone(),
-          );
-
-          threads.push(std::thread::spawn(move || {
-            let mut threads_read_buf = read_buf_arc.lock().unwrap();
-            let mut threads_kins_buf = kins_buf_arc.lock().unwrap();
-            calc_partial_kinship(&mut threads_read_buf, &mut threads_kins_buf, ids_num);
-            let mut res_matrix = res_matrix_arc.lock().unwrap();
-            for (buf_elem, common_matrix_elem) in
-              threads_kins_buf.iter_mut().zip(res_matrix.iter_mut())
-            {
-              *common_matrix_elem += *buf_elem;
-              *buf_elem = 0.0;
-            }
-            kinsh_proc_sender.send(buf_idx).unwrap();
-          }));
-        }
+        // Work unit contains sender tied with receiver in thread, to allow for
+        // dispatching work to worker threads.
+        work_unit.sender.clone().send(work_unit).unwrap();
       }
 
       assert!(
@@ -293,26 +311,21 @@ pub mod util {
       threads.into_iter().for_each(|thread| {
         thread
           .join()
-          .expect("The thread creating or execution failed !")
+          .expect("The thread creating or execution failed!")
       });
 
       self.file_reader.seek(SeekFrom::Start(self.snp_pos_start))?;
-
-      let mut res = Arc::try_unwrap(common_kinship_matrix)
-        .expect("Arc uwrapping failed. Kinship matrix is not accessible.")
-        .into_inner()
-        .expect("Mutex uwrapping failed. Kinship matrix is not accessible.");
 
       // Mirror Kinship matrix, since only the upper part was calculated (the
       // Kinship matrix is symmetrical because it's formed from it's transpose times itself).
       for i in 0..ids_num {
         let row_length = ids_num;
         for j in 0..i + 1 {
-          res[j * row_length + i] /= total_snps_read as f64;
-          res[i * row_length + j] = res[j * row_length + i];
+          common_kinship_matrix[j * row_length + i] /= total_snps_read as f64;
+          common_kinship_matrix[i * row_length + j] = common_kinship_matrix[j * row_length + i];
         }
       }
-      Ok(res)
+      Ok(common_kinship_matrix)
     }
 
     /// @brief Consumes comments lines from the stream. File cursor is left right
@@ -360,7 +373,7 @@ pub mod util {
   }
 
   pub fn calc_partial_kinship(
-    snps: &mut Vec<f64>,
+    snps: &Vec<f64>,
     partial_matrix: &mut Vec<f64>,
     ids_num: usize,
   ) -> () {
