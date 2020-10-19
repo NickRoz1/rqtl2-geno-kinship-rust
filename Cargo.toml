@@ -13,4 +13,8 @@ path = "src/lib.rs"
 [dependencies]
 num_cpus = "1.13.0"
 
+[[bin]]
+name = "test_lib"
+path = "src/bin.rs"
+
 
