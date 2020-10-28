@@ -551,15 +551,17 @@ fn consume_and_check_id_consume_alleles<'a>(
     return Ok(LineType::COMMENT);
   }
 
-  let wrong_order_err = std::io::Error::new(
-    std::io::ErrorKind::InvalidInput,
-    "Error: BIMBAM Mean Genotype File Format file\
+  let wrong_order_err = || {
+    std::io::Error::new(
+      std::io::ErrorKind::InvalidInput,
+      "Error: BIMBAM Mean Genotype File Format file\
       has different SNP records order than SNP Location File Format file.\n",
-  );
+    )
+  };
 
   use bstr::ByteSlice;
   if first_token.to_str_lossy() != expected_snp_id {
-    return Err(ParsingError::from(wrong_order_err));
+    return Err(ParsingError::from(wrong_order_err()));
   }
 
   let no_alleles_types_err = || {
