@@ -213,13 +213,11 @@ impl GenoReader {
     let kinship_merger_delegate = |work_unit: &mut WorkUnit| -> Result<bool, ParsingError> {
       // Merge results and restore result buffer.
       let merge_into = |chr_kinship_matrix: &mut Vec<f64>| {
-        for (buf_elem, matrix_elem) in work_unit
+        work_unit
           .result_buf
           .iter()
           .zip(chr_kinship_matrix.iter_mut())
-        {
-          *matrix_elem += *buf_elem;
-        }
+          .for_each(|(buf_elem, matrix_elem)| *matrix_elem += *buf_elem);
       };
 
       // LOCO
