@@ -3,6 +3,8 @@ use std::fmt;
 use std::io;
 use std::num;
 
+pub type Result<T> = std::result::Result<T, ParsingError>;
+
 // from https://blog.burntsushi.net/rust-error-handling/#composing-option-and-result
 //
 // We derive `Debug` because all types should probably derive `Debug`.

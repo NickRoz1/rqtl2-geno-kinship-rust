@@ -1,3 +1,5 @@
+use crate::util::error::ParsingError;
+use crate::util::tokenizers::tokenize_bimbam_or_rqtl2_line;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufRead;
@@ -5,7 +7,7 @@ use std::io::BufReader;
 use std::io::Seek;
 use std::io::SeekFrom;
 
-pub fn io_err(bad_str: String, msg: &str) -> std::io::Error {
+pub fn io_err(bad_str: &str, msg: &str) -> std::io::Error {
   std::io::Error::new(
     std::io::ErrorKind::InvalidInput,
     format!("This line <{}> is an invalid SNP record: {}", &bad_str, msg),
@@ -43,10 +45,10 @@ impl GenoParser {
     let markers = Self::consume_markers(&mut file_reader)?;
     Ok(GenoParser {
       snp_pos_start: file_reader.seek(SeekFrom::Current(0))?,
-      file_reader: file_reader,
-      comments: comments,
-      markers: markers,
-      hab_mapper: hab_mapper,
+      file_reader,
+      comments,
+      markers,
+      hab_mapper,
     })
   }
 
@@ -72,35 +74,35 @@ impl GenoParser {
   }
 
   fn parse_into(
-    snp_line: &String,
+    source: &[u8],
     parsed_snp_buf: &mut [f64],
     hab_mapper: &HashMap<char, f64>,
-  ) -> Result<(), crate::util::error::ParsingError> {
-    let snp = match snp_line.split('\t').skip(1).next() {
-      Some(snp_str) => snp_str,
-      None => Err(io_err(
-        snp_line.clone(),
+  ) -> Result<(), ParsingError> {
+    let mut tokens = tokenize_bimbam_or_rqtl2_line(source);
+    use bstr::ByteSlice;
+    let snp = tokens.nth(1).ok_or_else(|| {
+      io_err(
+        source.to_str().unwrap(),
         "snp record and row id must be separated with tab.",
-      ))?,
-    };
+      )
+    })?;
     if parsed_snp_buf.len() != snp.len() {
-      Err(io_err(
-        snp_line.clone(),
+      return Err(ParsingError::from(io_err(
+        source.to_str().unwrap(),
         &format!(
           "Invalid record: there are {} markers, however {} SNPs were parsed.",
           parsed_snp_buf.len(),
           snp.len()
         ),
-      ))?;
+      )));
     }
     for (buf_slot, snp_char) in parsed_snp_buf.iter_mut().zip(snp.chars()) {
-      *buf_slot = hab_mapper
-        .get(&snp_char)
-        .ok_or(io_err(
-          String::from(snp),
+      *buf_slot = *hab_mapper.get(&snp_char).ok_or_else(|| {
+        io_err(
+          &snp.to_str_lossy(),
           &format!("failed to convert SNP <{}> to a float value.", snp_char),
-        ))?
-        .clone();
+        )
+      })?;
     }
     Ok(())
   }
@@ -108,10 +110,7 @@ impl GenoParser {
   /// @brief Calculates kinship matrix for given geno data reading it in
   /// batches. The amount of buffer, so as memory consumption, depends on the
   /// amount of logical cores on the machine and amount of snps.
-  pub fn calc_kinship(
-    &mut self,
-    batch_size: usize,
-  ) -> Result<Vec<f64>, crate::util::error::ParsingError> {
+  pub fn calc_kinship(&mut self, batch_size: usize) -> Result<Vec<f64>, ParsingError> {
     if batch_size < 1 {
       panic!("Batch size can't be less than 1.");
     }
@@ -122,49 +121,42 @@ impl GenoParser {
     // This amount of snps will be parsed and processed on each iteration.
     let buf_size = ids_num * batch_size;
 
-    let file_reader = self.file_reader.get_mut();
-    let mut line_iter = BufReader::new(file_reader).lines();
     let mut total_snps_read: usize = 0;
     let markers_len = self.markers.len();
     let hab_mapper = self.hab_mapper.clone();
 
     use crate::util::kinship::WorkUnit;
-    let kinship_merger_delegate =
-      |work_unit: &mut WorkUnit| -> Result<bool, crate::util::error::ParsingError> {
-        // Merge results and restore result buffer.
-        for (buf_elem, common_matrix_elem) in work_unit
-          .result_buf
-          .iter_mut()
-          .zip(common_kinship_matrix.iter_mut())
-        {
-          *common_matrix_elem += *buf_elem;
-          *buf_elem = 0.0;
-        }
+    let kinship_merger_delegate = |work_unit: &mut WorkUnit| -> Result<bool, ParsingError> {
+      // Merge results and restore result buffer.
+      for (buf_elem, common_matrix_elem) in work_unit
+        .result_buf
+        .iter_mut()
+        .zip(common_kinship_matrix.iter_mut())
+      {
+        *common_matrix_elem += *buf_elem;
+        *buf_elem = 0.0;
+      }
 
-        let parser =
-          |source: &String, dest: &mut [f64]| Self::parse_into(source, dest, &hab_mapper);
+      let parser = |source: &[u8], dest: &mut [f64]| Self::parse_into(source, dest, &hab_mapper);
 
-        // Parse new batch (load work unit).
-        let line_count = match crate::util::kinship::fill_buffer(
-          &mut work_unit.input_buf.chunks_mut(markers_len),
-          &mut line_iter,
-          parser,
-        )? {
-          n => {
-            total_snps_read += n;
-            n
-          }
-        };
-        // Reached EOF (there is not enough records to form a full batch.).
-        // Resize buffer to discard data from previous iterations which was not
-        // overwritten because there is not enough lines to fill the whole
-        // buffer.
-        if line_count < batch_size {
-          work_unit.input_buf.resize(line_count * ids_num, 0.0);
-          return Ok(true);
-        }
-        return Ok(false);
-      };
+      // Parse new batch (load work unit).
+      let line_count = crate::util::kinship::fill_buffer_from_bytes(
+        &mut work_unit.input_buf.chunks_mut(markers_len),
+        &mut self.file_reader,
+        parser,
+      )?;
+
+      total_snps_read += line_count;
+      // Reached EOF (there is not enough records to form a full batch.).
+      // Resize buffer to discard data from previous iterations which was not
+      // overwritten because there is not enough lines to fill the whole
+      // buffer.
+      if line_count < batch_size {
+        work_unit.input_buf.resize(line_count * ids_num, 0.0);
+        return Ok(true);
+      }
+      Ok(false)
+    };
 
     use crate::util::kinship::calc_kinship_parallel;
     calc_kinship_parallel(kinship_merger_delegate, buf_size, ids_num)
@@ -182,7 +174,7 @@ impl GenoParser {
 
     self.file_reader.seek(SeekFrom::Start(self.snp_pos_start))?;
 
-    crate::util::kinship::mirror_and_normalize_kinship(
+    crate::util::kinship::mirror_and_scale_kinship(
       &mut common_kinship_matrix[..],
       ids_num,
       1.0 / (total_snps_read as f64),
@@ -229,7 +221,7 @@ impl GenoParser {
       markers
         .split('\t')
         .skip(1)
-        .map(|marker| String::from(marker))
+        .map(String::from)
         .collect::<Vec<String>>(),
     )
   }
@@ -249,7 +241,7 @@ pub fn parse_geno(
 
 /// @note Parse line with markers. File cursor is rewinded to the beginning of
 /// the file.
-/// Example: marker	10	12	38	39	42	54
+/// Example: marker\t10\t12\t38\t39\t42\t54
 pub fn parse_markers(file: &mut File) -> std::io::Result<Vec<String>> {
   let mut buf_reader = BufReader::new(file.try_clone()?);
   GenoParser::consume_comments(&mut buf_reader)?;
@@ -300,18 +292,19 @@ pub fn parse_snp_rec(
       .map(|ch| {
         hab_mapper
           .get(&ch)
-          .map(|v| *v)
-          .clone()
+          .copied()
           .expect(&format!("No key <{}> in SNP mapper.", ch)[..])
       })
       .collect::<Vec<f64>>()
   };
   let id_snp_tuple: (String, Vec<f64>) = (
     String::from(id),
-    parse_snps(&id_snp.next().ok_or(std::io::Error::new(
-      std::io::ErrorKind::InvalidInput,
-      format!("This line <{}> is an invalid SNP record.", line_str),
-    ))?),
+    parse_snps(&id_snp.next().ok_or_else(|| {
+      std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("This line <{}> is an invalid SNP record.", line_str),
+      )
+    })?),
   );
   Ok(id_snp_tuple)
 }
@@ -330,7 +323,7 @@ impl<'a> GenoParserIter<'a> {
   ) -> std::io::Result<Self> {
     Ok(Self {
       lines_reader: file_reader.lines(),
-      hab_mapper: hab_mapper,
+      hab_mapper,
     })
   }
 }
@@ -347,7 +340,7 @@ impl<'a> Iterator for GenoParserIter<'a> {
       Ok(val) => Some(val),
       Err(e) => {
         println!("Failed to parse the line. Error: {}", e);
-        return self.next();
+        self.next()
       }
     }
   }

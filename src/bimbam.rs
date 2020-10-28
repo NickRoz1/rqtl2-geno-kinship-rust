@@ -1,4 +1,5 @@
-use crate::util::error;
+use crate::util::error::ParsingError;
+use crate::util::tokenizers::tokenize_bimbam_or_rqtl2_line;
 use std::fs::File;
 use std::io::BufRead;
 use std::io::BufReader;
@@ -9,6 +10,21 @@ use std::io::SeekFrom;
 // and semi-colon de-limited, or mixed use of those.  (i.e.  entries can be
 // separated by commas, spaces, semi-colons or tabs).
 pub const GENO_SEPARATORS: &[char] = &['\t', ' ', ',', ';'];
+
+// Represents SNP id and alleles_types parsed from BIMBAM Mean Genotype File
+// Format file.
+// Example:
+//  This is what this type alias object holds.
+//  |   |  |
+//  ∨   ∨  ∨
+// rs1, A, T, 0.02, 0.80, 1.50 rs2, G, C, 0.98, 0.04, 1.00
+type SNPAndAllelesTypes = (String, (String, String));
+
+enum LineType {
+  SNP,
+  EMPTY,
+  COMMENT,
+}
 
 pub struct GenoReader {
   file_reader: BufReader<File>,
@@ -62,16 +78,25 @@ impl GenoReader {
 
     file_reader.seek(std::io::SeekFrom::Start(0))?;
     Ok(GenoReader {
-      file_reader: file_reader,
-      ids_num: ids_num,
+      file_reader,
+      ids_num,
     })
   }
 
-  fn parse_into(source: &String, dest: &mut [f64]) -> Result<(), crate::util::error::ParsingError> {
-    let mut tokens = tokenize_bimbam_line(source);
-    match consume_id_and_alleles(&mut tokens)? {
-      Some(s) => s,
-      None => panic!(
+  /// @brief Parses mean geno line in form of bytestring into preallocated buffer.
+  /// @note Only mean genos are filled into the buffer.
+  fn parse_into(
+    snp_name_from_snp_pos_iter: &str,
+    source: &[u8],
+    dest: &mut [f64],
+  ) -> Result<(), ParsingError> {
+    let mut tokens = tokenize_bimbam_or_rqtl2_line(source);
+
+    let line_type = consume_and_check_id_consume_alleles(snp_name_from_snp_pos_iter, &mut tokens)?;
+
+    match line_type {
+      LineType::SNP => (),
+      LineType::EMPTY | LineType::COMMENT => panic!(
         "Empty or comment lines should've been\
    covered inside fill_buff function."
       ),
@@ -88,7 +113,11 @@ impl GenoReader {
     let mut parsed_tokens_num = 0;
     // Array containing indices of NA values in parsed SNP array.
     let mut na_genos = vec![false; ids_num];
-    for ((i, buf_slot), token) in dest.iter_mut().enumerate().zip(tokens.by_ref()) {
+    for ((i, buf_slot), token) in dest
+      .iter_mut()
+      .enumerate()
+      .zip(tokens.by_ref().map(bstr::ByteSlice::to_str_lossy))
+    {
       if token == "NA" {
         na_genos[i] = true;
         continue;
@@ -118,60 +147,18 @@ impl GenoReader {
     }
 
     if tokens.next() != None || parsed_tokens_num != ids_num {
-      Err(std::io::Error::new(
+      use bstr::ByteSlice;
+      return Err(ParsingError::from(std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
         format!(
           "Error: buffer length is not equal to the amount of tokens.\n\
         This line is invalid: <{}>",
-          source
+          source.to_str().unwrap()
         ),
-      ))?
+      )));
     }
 
     Ok(())
-  }
-
-  fn extract_geno_line(
-    pos_snp_id: &String,
-    line_iter: &mut dyn Iterator<Item = std::io::Result<String>>,
-  ) -> std::io::Result<String> {
-    let not_enough_snp_records_err = std::io::Error::new(
-      std::io::ErrorKind::InvalidInput,
-      "Error: BIMBAM Mean Genotype File Format file\
-        has fewer records than SNP Location File Format file does.\n",
-    );
-
-    let line = match line_iter.next() {
-      Some(Err(e)) => return Err(e),
-      Some(Ok(s)) => s,
-      None => return Err(not_enough_snp_records_err),
-    };
-
-    let mut tokens = tokenize_bimbam_line(&line);
-    let no_snp_id_err = std::io::Error::new(
-      std::io::ErrorKind::InvalidData,
-      format!(
-        "Error: Encountered empty or comment line in BIMBAM Mean Genotype File \
-          Format file.\nLine: <{}>",
-        line
-      ),
-    );
-
-    let snp_id: String = match check_if_empty_or_comment(&mut tokens) {
-      Some(s) => s,
-      None => return Err(no_snp_id_err),
-    };
-
-    let wrong_order_err = std::io::Error::new(
-      std::io::ErrorKind::InvalidInput,
-      "Error: BIMBAM Mean Genotype File Format file\
-        has different SNP records order than SNP Location File Format file.\n",
-    );
-    if snp_id != *pos_snp_id {
-      return Err(wrong_order_err);
-    }
-
-    Ok(line)
   }
 
   /// @brief Calculates LOCO Kinship matrix for every chromosome.
@@ -189,10 +176,9 @@ impl GenoReader {
       panic!("Batch size can't be less than 1.");
     }
 
-    let snp_positions: Vec<(String, usize, String)> =
-      SnpPosIter::with_file(snp_pos_file)?.collect();
+    let snp_positions: Vec<SnpPosRecord> = SnpPosIter::with_file(snp_pos_file)?.collect();
 
-    if snp_positions.len() == 0 {
+    if snp_positions.is_empty() {
       panic!("File is empty.");
     }
 
@@ -206,147 +192,155 @@ impl GenoReader {
     // Maximum amount of SNPs that will be parsed and processed on each iteration.
     let buf_size = self.ids_num * batch_size;
 
-    let file_reader = self.file_reader.get_mut();
-    let mut line_iter = BufReader::new(file_reader).lines();
+    // let file_reader = self.file_reader.get_mut();
+    // let mut line_iter = BufReader::new(file_reader).lines();
 
     // Amount of SNPs parsed for each chromosome. Since it is assumed that the
     // SNPs are ordered by chromosomes, it's simply a sequential array of values
     // (no need for String keys).
     let mut chrs_parsed_snps_nums = Vec::<usize>::new();
     // Maps chromosomes indices to their names.
-    let mut chrs_names = Vec::<String>::new();
+    let mut chrs_names = Vec::<Option<String>>::new();
 
     use crate::util::kinship::WorkUnit;
     // Tracks the chromosome currently being processed.
+    // All SNPs without specified chromosome are associated with None chromosome
     let mut cur_chromosome = snp_positions[0].2.clone();
     // Tracks amount of snps on current chromosome.
     let mut cur_chr_total_snps_parsed: usize = 0;
     let mut cur_snp_idx = 0;
 
-    let kinship_merger_delegate =
-      |work_unit: &mut WorkUnit| -> Result<bool, crate::util::error::ParsingError> {
-        // Merge results and restore result buffer.
-        let merge_into = |chr_kinship_matrix: &mut Vec<f64>| {
-          for (buf_elem, matrix_elem) in work_unit
-            .result_buf
-            .iter()
-            .zip(chr_kinship_matrix.iter_mut())
-          {
-            *matrix_elem += *buf_elem;
-          }
-        };
-
-        // LOCO
-        for (i, res_matrix) in chrs_kinship_matrices.iter_mut().enumerate() {
-          if i != work_unit.chr_num {
-            merge_into(res_matrix);
-          }
+    let kinship_merger_delegate = |work_unit: &mut WorkUnit| -> Result<bool, ParsingError> {
+      // Merge results and restore result buffer.
+      let merge_into = |chr_kinship_matrix: &mut Vec<f64>| {
+        for (buf_elem, matrix_elem) in work_unit
+          .result_buf
+          .iter()
+          .zip(chr_kinship_matrix.iter_mut())
+        {
+          *matrix_elem += *buf_elem;
         }
-
-        for buf_elem in work_unit.result_buf.iter_mut() {
-          *buf_elem = 0.0;
-        }
-
-        let mut get_next_batch = || -> Option<(Vec<&String>, Option<String>)> {
-          let mut snps_ids = Vec::new();
-          loop {
-            if cur_snp_idx == snp_positions.len() {
-              // Parsed all records.
-              return None;
-            }
-            let (snp_id, _, snp_chr) = &snp_positions[cur_snp_idx];
-            if cur_chromosome != *snp_chr {
-              // New chromosome encountered.
-              return Some((snps_ids, Some(snp_chr.clone())));
-            }
-            if snps_ids.len() == batch_size {
-              // Batch is full.
-              break;
-            }
-            snps_ids.push(snp_id);
-            cur_snp_idx += 1;
-
-            if cur_snp_idx == snp_positions.len() {
-              // No more records left.
-              break;
-            }
-          }
-          // Batch was filled. No new chromosome was encountered yet.
-          return Some((snps_ids, None));
-        };
-
-        // Batch of SNP ids on a single chromosome to be processed.
-        let (snp_batch_on_chr, new_chr) = match get_next_batch() {
-          Some(tup) => tup,
-          // Reached EOF. Resize buffer to discard data from previous iterations
-          // which was not overwritten because there is not enough lines to fill the
-          // whole buffer.
-          None => {
-            if cur_chr_total_snps_parsed != 0 {
-              chrs_parsed_snps_nums.push(cur_chr_total_snps_parsed.clone());
-              chrs_names.push(cur_chromosome.clone());
-              cur_chr_total_snps_parsed = 0;
-              cur_chromosome.clear();
-            }
-
-            if line_iter.next().is_none() == false {
-              Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Error: BIMBAM Mean Genotype File Format file \
-                has more records than SNP Location File Format file does.\n",
-              ))?;
-            }
-            return Ok(true);
-          }
-        };
-
-        // Parses line from Lines iterator over <Mean Genotype File Format> file,
-        // checks it and returns String.
-        let check_and_extract_line =
-          |pos_snp_id: &&String| Self::extract_geno_line(*pos_snp_id, &mut line_iter);
-
-        // This iter yields only the SNPs located on the same chromosome.
-        let mut wrapped_line_iter = snp_batch_on_chr.iter().map(check_and_extract_line);
-
-        let parser = |source: &String, dest: &mut [f64]| Self::parse_into(source, dest);
-
-        // Parse new batch (load work unit).
-        let line_count = match crate::util::kinship::fill_buffer(
-          &mut work_unit.input_buf.chunks_mut(ids_num),
-          &mut wrapped_line_iter,
-          parser,
-        )? {
-          n => {
-            cur_chr_total_snps_parsed += n;
-            n
-          }
-        };
-
-        // Set the current chromosome number. <chrs_parsed_snps_nums> contains
-        // records for all chromosome parsed or in process of parsing up to this
-        // moment. The id of the last chromosome in the array (or size of the
-        // array) represents the current chromosome id, since the actual id,
-        // which is represented as String does not matter (the records are
-        // ordered by chromosome).
-        work_unit.chr_num = chrs_parsed_snps_nums.len();
-
-        // Resize buffer so old data gets discarded.
-        if line_count < batch_size {
-          work_unit.input_buf.resize(line_count * ids_num, 0.0);
-        }
-
-        if !new_chr.is_none() {
-          chrs_parsed_snps_nums.push(cur_chr_total_snps_parsed.clone());
-          chrs_names.push(cur_chromosome.clone());
-          cur_chromosome = new_chr.unwrap();
-          cur_chr_total_snps_parsed = 0;
-        }
-
-        return Ok(false);
       };
 
+      // LOCO
+      for (i, res_matrix) in chrs_kinship_matrices.iter_mut().enumerate() {
+        if i != work_unit.chr_num {
+          merge_into(res_matrix);
+        }
+      }
+
+      for buf_elem in work_unit.result_buf.iter_mut() {
+        *buf_elem = 0.0;
+      }
+
+      let mut get_next_batch = || -> Option<(Vec<&String>, Option<Option<String>>)> {
+        let mut snps_ids = Vec::new();
+        loop {
+          if cur_snp_idx == snp_positions.len() {
+            // Parsed all records.
+            return None;
+          }
+          let (snp_id, _, snp_chr) = &snp_positions[cur_snp_idx];
+          if cur_chromosome != *snp_chr {
+            // New chromosome encountered.
+            return Some((snps_ids, Some(snp_chr.clone())));
+          }
+          if snps_ids.len() == batch_size {
+            // Batch is full.
+            break;
+          }
+          snps_ids.push(snp_id);
+          cur_snp_idx += 1;
+
+          if cur_snp_idx == snp_positions.len() {
+            // No more records left.
+            break;
+          }
+        }
+        // Batch was filled. No new chromosome was encountered yet.
+        Some((snps_ids, None))
+      };
+
+      // Batch of SNP ids on a single chromosome to be processed.
+      let (snp_batch_on_chr, new_chr) = match get_next_batch() {
+        Some(tup) => tup,
+        // Reached EOF. Resize buffer to discard data from previous iterations
+        // which was not overwritten because there is not enough lines to fill the
+        // whole buffer.
+        None => {
+          if cur_chr_total_snps_parsed != 0 {
+            chrs_parsed_snps_nums.push(cur_chr_total_snps_parsed);
+            chrs_names.push(cur_chromosome.clone());
+            cur_chr_total_snps_parsed = 0;
+            cur_chromosome = None;
+          }
+
+          let mut str_buf = String::new();
+          let err_not_enough_snps = std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Error: BIMBAM Mean Genotype File Format file \
+              has more records than SNP Location File Format file does.\n",
+          );
+
+          // Check if EOF is reached
+          if self.file_reader.read_line(&mut str_buf)? != 0 {
+            return Err(ParsingError::from(err_not_enough_snps));
+          }
+          return Ok(true);
+        }
+      };
+
+      let mut snps_ids = snp_batch_on_chr.iter();
+      let parser =
+        |source: &[u8], dest: &mut [f64]| Self::parse_into(snps_ids.next().unwrap(), source, dest);
+
+      // Resize the buffer so only the SNPs on this chromosome get parsed into it.
+      work_unit
+        .input_buf
+        .resize(snp_batch_on_chr.len() * ids_num, 0.0);
+
+      // Parse new batch (load work unit).
+      let line_count = crate::util::kinship::fill_buffer_from_bytes(
+        &mut work_unit.input_buf.chunks_mut(ids_num),
+        &mut self.file_reader,
+        parser,
+      )?;
+
+      cur_chr_total_snps_parsed += line_count;
+
+      if line_count < snp_batch_on_chr.len() {
+        return Err(ParsingError::from(std::io::Error::new(
+          std::io::ErrorKind::InvalidInput,
+          "Error: BIMBAM Mean Genotype File Format file\
+            has fewer records than SNP Location File Format file does.\n",
+        )));
+      }
+
+      // Set the current chromosome number. <chrs_parsed_snps_nums> contains
+      // records for all chromosome parsed or in process of parsing up to this
+      // moment. The id of the last chromosome in the array (or size of the
+      // array) represents the current chromosome id, since the actual id,
+      // which is represented as String does not matter (the records are
+      // ordered by chromosome).
+      work_unit.chr_num = chrs_parsed_snps_nums.len();
+
+      // Resize buffer so old data gets discarded.
+      if line_count < batch_size {
+        work_unit.input_buf.resize(line_count * ids_num, 0.0);
+      }
+
+      if let Some(n_chr) = new_chr {
+        chrs_parsed_snps_nums.push(cur_chr_total_snps_parsed);
+        chrs_names.push(cur_chromosome.clone());
+        cur_chromosome = n_chr;
+        cur_chr_total_snps_parsed = 0;
+      }
+
+      Ok(false)
+    };
+
     use crate::util::kinship::calc_kinship_parallel;
-    calc_kinship_parallel(kinship_merger_delegate, buf_size, self.ids_num)
+    calc_kinship_parallel(kinship_merger_delegate, buf_size, ids_num)
       .expect("Parallel processing failed.");
 
     let total: usize = chrs_parsed_snps_nums.iter().sum();
@@ -355,7 +349,7 @@ impl GenoReader {
       .iter_mut()
       .zip(chrs_parsed_snps_nums.into_iter())
     {
-      crate::util::kinship::mirror_and_normalize_kinship(
+      crate::util::kinship::mirror_and_scale_kinship(
         &mut chrs_kinship_matrix[..],
         self.ids_num,
         1.0 / ((total - chrs_parsed_snps_num) as f64),
@@ -367,6 +361,7 @@ impl GenoReader {
     Ok(
       chrs_names
         .into_iter()
+        .map(|name| name.unwrap_or_else(|| "None".to_owned()))
         .zip(chrs_kinship_matrices.into_iter())
         .collect(),
     )
@@ -375,8 +370,9 @@ impl GenoReader {
   pub fn iter(&mut self) -> std::io::Result<GenoReaderIter> {
     self.file_reader.seek(SeekFrom::Start(0))?;
     Ok(GenoReaderIter {
-      lines_reader: (&mut self.file_reader).lines(),
+      file_reader: &mut self.file_reader,
       ids_num: self.ids_num,
+      read_buf: Vec::<u8>::new(),
     })
   }
 }
@@ -407,24 +403,34 @@ pub struct MeanGenoLine {
 }
 
 pub struct GenoReaderIter<'a> {
-  lines_reader: std::io::Lines<&'a mut BufReader<File>>,
+  file_reader: &'a mut BufReader<File>,
   ids_num: usize,
+  read_buf: Vec<u8>,
 }
 
 impl<'a> Iterator for GenoReaderIter<'a> {
   type Item = MeanGenoLine;
 
   fn next(&mut self) -> Option<Self::Item> {
-    let on_err = |it: &mut Self, e: error::ParsingError| {
+    // Dump old data
+    self.read_buf.clear();
+
+    let on_err = |it: &mut Self, e: ParsingError| {
       eprintln!("Failed to parse line. Parsing next line... Error: <{}>", e);
-      return it.next();
+      it.next()
     };
 
-    let line = match self.lines_reader.next()? {
-      Ok(string) => string,
-      Err(e) => return on_err(self, error::ParsingError::Io(e)),
+    match self.file_reader.read_until(b'\n', &mut self.read_buf) {
+      Ok(read_bytes_n) => {
+        if read_bytes_n == 0 {
+          // EOF is reached.
+          return None;
+        }
+      }
+      Err(e) => return on_err(self, ParsingError::Io(e)),
     };
-    match parse_geno_line(&line) {
+
+    match parse_geno_line(&self.read_buf) {
       Ok(Some(mean_geno_line)) => {
         if mean_geno_line.mean_genos.len() != self.ids_num {
           eprintln!(
@@ -451,76 +457,58 @@ impl<'a> Iterator for GenoReaderIter<'a> {
   }
 }
 
-/// @brief Tokenizes BIMBAM line (separates original line on tokens by the
-/// separators from const SEPARATORS array)
-pub fn tokenize_bimbam_line<'a>(
-  line: &'a str,
-) -> std::iter::Filter<std::str::Split<&'a [char]>, fn(&&str) -> bool> {
-  // If a string contains multiple contiguous separators, you will end up with
-  // empty strings in the output:
-  // https://doc.rust-lang.org/std/primitive.str.html#method.split
-  //
-  // To specify the type of the iterator it should have a complete type. Since
-  //  unboxed closures - a filter predicate in this case - are anonymous, this
-  //  is not possible without explicitly defining function.
-  //  https://stackoverflow.com/questions/30641167/figuring-out-return-type-of-closure
-  let filter_fn = |token: &&str| !token.is_empty();
-
-  line
-    .split(&GENO_SEPARATORS[..])
-    // Each named function has unique signature, converting to function pointer
-    // via <as> keyword.
-    .filter(filter_fn as fn(&&str) -> bool)
-}
-
 /// @brief Parses line from BIMBAM Mean Genotype File Format file.
 /// If line is empty or contains a comment, None is returned.
 ///
 /// @in line full line from file, e.g. "rs1, A, T, 0.02"
 ///
 /// @note https://www.haplotype.org/download/bimbam-manual.pdf
-pub fn parse_geno_line(line: &str) -> Result<Option<MeanGenoLine>, error::ParsingError> {
-  let mut tokens = tokenize_bimbam_line(line);
+pub fn parse_geno_line(line: &[u8]) -> Result<Option<MeanGenoLine>, ParsingError> {
+  let mut tokens = tokenize_bimbam_or_rqtl2_line(line);
 
-  let (snp_id, alleles_types) = match consume_id_and_alleles(&mut tokens)? {
+  let (snp_id, alleles_types) = match parse_id_and_alleles(&mut tokens)? {
     Some(id_and_alleles) => id_and_alleles,
     None => return Ok(None),
   };
 
   let mean_genos: Vec<f64> = tokens
+    .map(bstr::ByteSlice::to_str_lossy)
     .map(|mean_geno| mean_geno.parse::<f64>())
     .collect::<Result<Vec<f64>, _>>()?;
-  if mean_genos.len() < 1 {
-    return Err(std::io::Error::new(
+  if mean_genos.is_empty() {
+    use bstr::ByteSlice;
+    return Err(ParsingError::from(std::io::Error::new(
       std::io::ErrorKind::InvalidInput,
       format!(
         "BIMBAM Mean Genotype File Format file\n\
         line must have at least 1 mean genotype.\n\
         This line is invalid: <{}>",
-        line
+        line.to_str().unwrap()
       ),
-    ))?;
+    )));
   }
   Ok(Some(MeanGenoLine {
-    snp_id: snp_id.to_owned(),
-    alleles_types: alleles_types,
-    mean_genos: mean_genos,
+    snp_id,
+    alleles_types,
+    mean_genos,
     pos: None,
     chr: None,
   }))
 }
 
-/// @brief Checks if line is comment and if it's empty. Returns Some(snp_id) if not.
-fn check_if_empty_or_comment(
-  tokens: &mut std::iter::Filter<std::str::Split<&[char]>, fn(&&str) -> bool>,
+/// @brief Attempts to extract snp id from token iterator. If the line
+/// corresponding to the token iterator is empty or comment line, returns None.
+fn extract_snp_if_not_empty_or_comment<'a>(
+  tokens: &mut impl Iterator<Item = &'a [u8]>,
 ) -> Option<String> {
+  use bstr::ByteSlice;
   let first_token = String::from(match tokens.next() {
-    Some(token_str) => token_str,
+    Some(token_str) => token_str.to_str_lossy(),
     // Empty line
     None => return None,
   });
 
-  if first_token.chars().nth(0).unwrap() == '#' {
+  if first_token.starts_with('#') {
     // Comment line
     return None;
   }
@@ -528,12 +516,73 @@ fn check_if_empty_or_comment(
   Some(first_token)
 }
 
-/// @brief Consume snp id and alleles types from token iterator over BIMBAM Mean
+/// @brief Consumes token from token iterator over BIMBAM Mean Genotype File
+/// Format file line. Determines whether the line contains SNP or is comment or
+/// empty line.
+pub fn check_is_empty_or_comment<'a>(tokens: &mut impl Iterator<Item = &'a [u8]>) -> bool {
+  let first_token = match tokens.next() {
+    Some(token_str) => token_str,
+    // Empty line
+    None => return true,
+  };
+
+  if *first_token.first().unwrap() == b'#' {
+    // Comment line
+    return true;
+  }
+
+  false
+}
+
+// @brief Consume snp id and alleles types from token iterator over BIMBAM Mean
+// Genotype File format file line.
+fn consume_and_check_id_consume_alleles<'a>(
+  expected_snp_id: &str,
+  tokens: &mut impl Iterator<Item = &'a [u8]>,
+) -> Result<LineType, ParsingError> {
+  let first_token = match tokens.next() {
+    Some(token_str) => token_str,
+    // Empty line
+    None => return Ok(LineType::EMPTY),
+  };
+
+  if *first_token.first().unwrap() == b'#' {
+    // Comment line
+    return Ok(LineType::COMMENT);
+  }
+
+  let wrong_order_err = std::io::Error::new(
+    std::io::ErrorKind::InvalidInput,
+    "Error: BIMBAM Mean Genotype File Format file\
+      has different SNP records order than SNP Location File Format file.\n",
+  );
+
+  use bstr::ByteSlice;
+  if first_token.to_str_lossy() != expected_snp_id {
+    return Err(ParsingError::from(wrong_order_err));
+  }
+
+  let no_alleles_types_err = || {
+    std::io::Error::new(
+      std::io::ErrorKind::InvalidInput,
+      "BIMBAM Mean Genotype File Format file\n\
+      line must have 2 alleles types.",
+    )
+  };
+
+  // Alleles types.
+  tokens.next().ok_or_else(no_alleles_types_err)?;
+  tokens.next().ok_or_else(no_alleles_types_err)?;
+
+  Ok(LineType::SNP)
+}
+
+/// @brief Parse snp id and alleles types from token iterator over BIMBAM Mean
 /// Genotype File Format file line.
-fn consume_id_and_alleles(
-  tokens: &mut std::iter::Filter<std::str::Split<&[char]>, fn(&&str) -> bool>,
-) -> Result<Option<(String, (String, String))>, error::ParsingError> {
-  let snp_id = match check_if_empty_or_comment(tokens) {
+fn parse_id_and_alleles<'a>(
+  tokens: &mut impl Iterator<Item = &'a [u8]>,
+) -> Result<Option<SNPAndAllelesTypes>, ParsingError> {
+  let snp_id = match extract_snp_if_not_empty_or_comment(tokens) {
     Some(snp_id_str) => snp_id_str,
     // Empty line
     None => return Ok(None),
@@ -546,9 +595,20 @@ fn consume_id_and_alleles(
       line must have 2 alleles types.",
     )
   };
+  use bstr::ByteSlice;
   let alleles_types = (
-    String::from(tokens.next().ok_or_else(no_alleles_types_err)?),
-    String::from(tokens.next().ok_or_else(no_alleles_types_err)?),
+    String::from(
+      tokens
+        .next()
+        .ok_or_else(no_alleles_types_err)?
+        .to_str_lossy(),
+    ),
+    String::from(
+      tokens
+        .next()
+        .ok_or_else(no_alleles_types_err)?
+        .to_str_lossy(),
+    ),
   );
 
   Ok(Some((snp_id, alleles_types)))
@@ -584,9 +644,18 @@ pub fn parse_mean_geno_into(
   Ok(())
 }
 
+// Represents SNP id, SNP physical location (position), and chromosome ID from  SNP Location File Format file.
+// Example:
+//  This is what this type alias object holds.
+//  |     |    |
+//  ∨     ∨    ∨
+// rs1, 1200,  1
+type SnpPosRecord = (String, usize, Option<String>);
+
 /// @brief This iterator parses lines from SNP Location File Format file.
 pub struct SnpPosIter {
-  lines_reader: std::io::Lines<BufReader<File>>,
+  file_reader: BufReader<File>,
+  read_buf: Vec<u8>,
 }
 
 impl SnpPosIter {
@@ -598,11 +667,12 @@ impl SnpPosIter {
   pub fn with_file(file: File) -> std::io::Result<Self> {
     let file_reader = BufReader::new(file);
     Ok(SnpPosIter {
-      lines_reader: file_reader.lines(),
+      file_reader,
+      read_buf: Vec::<u8>::new(),
     })
   }
 
-  pub fn count_chromosomes(snp_pos_list: &Vec<(String, usize, String)>) -> usize {
+  pub fn count_chromosomes(snp_pos_list: &[SnpPosRecord]) -> usize {
     let mut chr_count = 0;
     let mut i = 0;
     loop {
@@ -627,54 +697,63 @@ impl SnpPosIter {
 }
 
 impl Iterator for SnpPosIter {
-  type Item = (String, usize, String);
+  type Item = SnpPosRecord;
 
   fn next(&mut self) -> Option<Self::Item> {
-    let on_err = |it: &mut Self, e: error::ParsingError| {
+    // Dump old data
+    self.read_buf.clear();
+
+    let on_err = |it: &mut Self, e: ParsingError| {
       eprintln!("Failed to parse line. Parsing next line... Error: <{}>", e);
-      return it.next();
+      it.next()
     };
 
-    let line = match self.lines_reader.next()? {
-      Ok(string) => string,
-      Err(e) => return on_err(self, error::ParsingError::Io(e)),
+    match self.file_reader.read_until(b'\n', &mut self.read_buf) {
+      Ok(read_bytes_n) => {
+        if read_bytes_n == 0 {
+          // EOF is reached.
+          return None;
+        }
+      }
+      Err(e) => return on_err(self, ParsingError::Io(e)),
     };
 
-    let err_msg = format!(
-      "Failed to parse the line.\nThis line is invalid: <{}>.\
+    let err_msg = |line: &str| {
+      format!(
+        "Failed to parse the line.\nThis line is invalid: <{}>.\
       \nParsing next line...",
-      line
-    );
+        line
+      )
+    };
 
-    let mut tokens = tokenize_bimbam_line(&line);
+    let mut tokens = tokenize_bimbam_or_rqtl2_line(&self.read_buf);
 
-    let snp_id = match check_if_empty_or_comment(&mut tokens) {
+    let snp_id = match extract_snp_if_not_empty_or_comment(&mut tokens) {
       Some(snp_id_str) => snp_id_str,
       // Empty line,
       None => return self.next(),
     };
 
+    use bstr::ByteSlice;
     let pos = match tokens.next() {
-      Some(token) => match token.parse::<usize>() {
+      Some(token) => match token.to_str_lossy().parse::<usize>() {
         Ok(val) => val,
         Err(_) => {
-          eprintln!("{}", err_msg);
+          eprintln!("{}", err_msg(self.read_buf.to_str().unwrap()));
           return self.next();
         }
       },
       None => {
-        eprintln!("{}", err_msg);
+        eprintln!("{}", err_msg(self.read_buf.to_str().unwrap()));
         return self.next();
       }
     };
 
-    let chr = match tokens.next() {
-      Some(token) => String::from(token),
-      None => {
-        eprintln!("{}", err_msg);
-        return self.next();
-      }
-    };
+    // Chromosome field is optional.
+    let chr = tokens
+      .next()
+      .map(bstr::ByteSlice::to_str_lossy)
+      .map(String::from);
 
     Some((snp_id, pos, chr))
   }

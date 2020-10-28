@@ -1,7 +1,8 @@
 // This module hosts Kinship calculator implementation.
 // ----------------------------------------------------------------------------
 
-// @brief Unit of work when processing geno file in parallel.
+// @brief Unit of work when processing geno file in parallel (calculating
+// Kinship matrix).
 // @note Gets dispatched to a thread.
 pub struct WorkUnit {
   pub sender: std::sync::mpsc::Sender<WorkUnit>,
@@ -76,13 +77,11 @@ pub struct WorkUnit {
 /// consumer (which receives, merges and dispatches the work units). This
 /// causes recv to error, terminating the dispatching loop, finishing the
 /// geno file processing.
-pub fn calc_kinship_parallel<
-  F: FnMut(&mut WorkUnit) -> Result<bool, crate::util::error::ParsingError>,
->(
-  mut processor: F,
+pub fn calc_kinship_parallel(
+  mut processor: impl FnMut(&mut WorkUnit) -> super::error::Result<bool>,
   read_buf_size: usize,
   ids_num: usize,
-) -> Result<(), crate::util::error::ParsingError> {
+) -> Result<(), super::error::ParsingError> {
   // For each physical thread a buffers will be created.
   let buf_num = num_cpus::get();
   use std::sync::mpsc::channel;
@@ -139,7 +138,7 @@ pub fn calc_kinship_parallel<
   Ok(())
 }
 
-fn calc_partial_kinship(snps: &Vec<f64>, partial_matrix: &mut Vec<f64>, ids_num: usize) -> () {
+fn calc_partial_kinship(snps: &[f64], partial_matrix: &mut Vec<f64>, ids_num: usize) {
   let n = ids_num;
   let k = snps.len() / n;
   // Algorithm from BLAS dsyrk:
@@ -176,15 +175,13 @@ fn calc_partial_kinship(snps: &Vec<f64>, partial_matrix: &mut Vec<f64>, ids_num:
     }
   }
 }
-// std::io::Lines<std::io::BufReader<&mut std::fs::File>>
+
 /// @brief Fills preallocated buffer with parsed values.
-pub fn fill_buffer<
-  F: FnMut(&String, &mut [f64]) -> Result<(), crate::util::error::ParsingError>,
->(
+pub fn fill_buffer(
   fill_buf: &mut std::slice::ChunksMut<f64>,
-  lines_iter: &mut dyn Iterator<Item = std::io::Result<String>>,
-  mut parser: F,
-) -> Result<usize, crate::util::error::ParsingError> {
+  lines_iter: impl Iterator<Item = std::io::Result<String>>,
+  mut parser: impl FnMut(&String, &mut [f64]) -> super::error::Result<()>,
+) -> super::error::Result<usize> {
   let mut parsed_lines_counter: usize = 0;
   for (line_slice, snp_line) in fill_buf.zip(lines_iter) {
     parser(&snp_line?, line_slice)?;
@@ -193,17 +190,34 @@ pub fn fill_buffer<
   Ok(parsed_lines_counter)
 }
 
+/// @brief Fills preallocated buffer with values parsed from bytes stream.
+pub fn fill_buffer_from_bytes(
+  fill_buf: &mut std::slice::ChunksMut<f64>,
+  file_reader: &mut std::io::BufReader<std::fs::File>,
+  mut parser: impl FnMut(&[u8], &mut [f64]) -> super::error::Result<()>,
+) -> super::error::Result<usize> {
+  let mut parsed_lines_counter: usize = 0;
+  let mut read_buf = Vec::<u8>::new();
+  use std::io::BufRead;
+  for buf_slot in fill_buf {
+    read_buf.clear();
+    let bytes_num = file_reader.read_until(b'\n', &mut read_buf)?;
+    if bytes_num == 0 {
+      return Ok(parsed_lines_counter);
+    }
+    parser(&read_buf, buf_slot)?;
+    parsed_lines_counter += 1;
+  }
+  Ok(parsed_lines_counter)
+}
+
 /// @brief Mirrors and scales Kinship matrix, since only the upper part was
 /// calculated (the Kinship matrix is symmetrical because it's formed from it's
 /// transpose times itself).
-pub fn mirror_and_normalize_kinship(
-  common_kinship_matrix: &mut [f64],
-  ids_num: usize,
-  scale: f64,
-) -> () {
+pub fn mirror_and_scale_kinship(common_kinship_matrix: &mut [f64], ids_num: usize, scale: f64) {
   for i in 0..ids_num {
     let row_length = ids_num;
-    for j in 0..i + 1 {
+    for j in 0..=i {
       common_kinship_matrix[j * row_length + i] *= scale as f64;
       common_kinship_matrix[i * row_length + j] = common_kinship_matrix[j * row_length + i];
     }

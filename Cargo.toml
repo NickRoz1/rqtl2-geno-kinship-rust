@@ -12,9 +12,15 @@ path = "src/lib.rs"
 
 [dependencies]
 num_cpus = "1.13.0"
+bstr = "0.2.14"
+criterion = "0.3"
 
 [[bin]]
 name = "test_lib"
 path = "src/bin.rs"
+
+[[bench]]
+name = "bench_buf_filler"
+harness = false
 
 

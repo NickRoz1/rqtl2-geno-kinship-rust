@@ -3,7 +3,8 @@ fn main() {
   // test_rqtl_kinship();
 }
 
-fn test_bimbam_kinship() -> () {
+#[allow(dead_code)]
+fn test_bimbam_kinship() {
   let open_file_in_cur_dir = |name| {
     let mut path_input_file = std::env::current_dir().unwrap();
     path_input_file.push(name);
@@ -33,30 +34,30 @@ fn test_bimbam_kinship() -> () {
     writeln!(output_file, "{}", line).unwrap();
   }
 }
+#[allow(dead_code)]
+fn test_rqtl_kinship() {
+  use std::collections::HashMap;
+  let mut hab_mapper = HashMap::new();
+  use std::f64::NAN;
 
-// fn test_rqtl_kinship() -> () {
-//   use std::collections::HashMap;
-//   let mut hab_mapper = HashMap::new();
-//   use std::f64::NAN;
+  hab_mapper.insert('A', 0.0);
+  hab_mapper.insert('H', 0.5);
+  hab_mapper.insert('B', 1.0);
+  hab_mapper.insert('-', NAN);
+  use std::env;
+  let name = "src/21487-pheno_geno.txt";
+  let mut path = env::current_dir().unwrap();
+  path.push(name);
 
-//   hab_mapper.insert('A', 0.0);
-//   hab_mapper.insert('H', 0.5);
-//   hab_mapper.insert('B', 1.0);
-//   hab_mapper.insert('-', NAN);
-//   use std::env;
-//   let name = "src/21487-pheno_geno.txt";
-//   let mut path = env::current_dir().unwrap();
-//   path.push(name);
+  let f2 = std::fs::OpenOptions::new()
+    .create(true)
+    .write(true)
+    .read(true)
+    .open(&path)
+    .unwrap();
 
-//   let f2 = std::fs::OpenOptions::new()
-//     .create(true)
-//     .write(true)
-//     .read(true)
-//     .open(&path)
-//     .unwrap();
+  let mut geno_parser_2 =
+    rqtl2::rqtl2::GenoParser::new_with_file(f2, hab_mapper).expect("Failed to create GenoParser");
 
-//   let mut geno_parser_2 = rqtl2::rqtl2::GenoParser::new_with_file(f2, hab_mapper.clone())
-//     .expect("Failed to create GenoParser");
-
-//   println!("{:?}", geno_parser_2.calc_kinship(1000));
-// }
+  println!("{:?}", geno_parser_2.calc_kinship(1000));
+}

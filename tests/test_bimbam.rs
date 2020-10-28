@@ -42,19 +42,19 @@ mod tests {
     use rqtl2::bimbam::parse_geno_line;
     use rqtl2::bimbam::MeanGenoLine;
 
-    let line_commas = "rs1, A, T, 0.02, 0.80, 1.50";
-    let line_spaces = "rs1 A T 0.02 0.80 1.50";
-    let line_tabs = "rs1\tA\tT\t0.02\t0.80\t1.50";
+    let line_commas = b"rs1, A, T, 0.02, 0.80, 1.50";
+    let line_spaces = b"rs1 A T 0.02 0.80 1.50";
+    let line_tabs = b"rs1\tA\tT\t0.02\t0.80\t1.50";
 
-    let comment_line_1 = "#rs1, A, T, 0.02, 0.80, 1.50";
-    let comment_line_2 = "# rs1, A, T, 0.02, 0.80, 1.50";
+    let comment_line_1 = b"#rs1, A, T, 0.02, 0.80, 1.50";
+    let comment_line_2 = b"# rs1, A, T, 0.02, 0.80, 1.50";
 
-    let empty_line = "";
+    let empty_line = b"";
 
     // One allele type is missing
-    let error_line_1 = "rs1, A, 0.02, 0.80, 1.50";
+    let error_line_1 = b"rs1, A, 0.02, 0.80, 1.50";
     // Mean genos are missing
-    let error_line_2 = "rs1, A, T";
+    let error_line_2 = b"rs1, A, T";
 
     let reference = MeanGenoLine {
       snp_id: "rs1".to_owned(),
@@ -64,24 +64,24 @@ mod tests {
       chr: None,
     };
 
-    let check = |line: &str| {
+    let check = |line: &[u8]| {
       assert!(compare_against_ref(
         &parse_geno_line(&line).unwrap().unwrap(),
         &reference
       ))
     };
 
-    check(&line_commas);
-    check(&line_spaces);
-    check(&line_tabs);
+    check(line_commas);
+    check(line_spaces);
+    check(line_tabs);
 
-    assert!(parse_geno_line(&comment_line_1).unwrap().is_none());
-    assert!(parse_geno_line(&comment_line_2).unwrap().is_none());
-    assert!(parse_geno_line(&empty_line).unwrap().is_none());
+    assert!(parse_geno_line(comment_line_1).unwrap().is_none());
+    assert!(parse_geno_line(comment_line_2).unwrap().is_none());
+    assert!(parse_geno_line(empty_line).unwrap().is_none());
 
     let expected_err = std::io::ErrorKind::InvalidInput;
 
-    let check_err = |error_line: &str| {
+    let check_err = |error_line: &[u8]| {
       if let Err(rqtl2::util::error::ParsingError::Io(err)) = parse_geno_line(error_line) {
         assert_eq!(err.kind(), expected_err);
       }
@@ -128,25 +128,6 @@ mod tests {
     for (res, exp) in geno_reader.iter().unwrap().zip(expected_iter.iter()) {
       assert!(compare_against_ref(&res, &exp));
     }
-
-    // let expected_extraction_iter = [[0.02, 0.80, 1.50], [0.98, 0.04, 1.00]];
-    // assert_eq!(
-    //   geno_reader
-    //     .extraction_iter()
-    //     .unwrap()
-    //     .map(|mean_genos| mean_genos.iter().count())
-    //     .fold(0, |acc, mean_genos_num| acc + mean_genos_num),
-    //   expected_extraction_iter
-    //     .map(|exp| exp.count())
-    //     .fold(0, |acc, x| acc + x)
-    // );
-    // for (res, exp) in geno_reader
-    //   .extraction_iter()
-    //   .unwrap()
-    //   .zip(expected_extraction_iter.iter())
-    // {
-    //   assert_eq!(res.parse::<f64>(), exp);
-    // }
   }
 
   #[test]
@@ -161,10 +142,10 @@ mod tests {
 
     let snp_pos_iter = rqtl2::bimbam::SnpPosIter::with_file(file).unwrap();
 
-    let res: Vec<(String, usize, String)> = snp_pos_iter.collect();
-    let expected: Vec<(String, usize, String)> = vec![
-      ("rs31443144".to_owned(), 3010274, "1".to_owned()),
-      ("rs30991578".to_owned(), 11793253, "1".to_owned()),
+    let res: Vec<(String, usize, Option<String>)> = snp_pos_iter.collect();
+    let expected: Vec<(String, usize, Option<String>)> = vec![
+      ("rs31443144".to_owned(), 3010274, Some("1".to_owned())),
+      ("rs30991578".to_owned(), 11793253, Some("1".to_owned())),
     ];
 
     assert_eq!(res.len(), expected.len());
@@ -229,7 +210,7 @@ mod tests {
     for (res, exp) in result.iter().map(|(_, arr)| arr).zip(expected.iter()) {
       assert_eq!(res.len(), exp.len());
       for (e_1, e_2) in res.iter().zip(exp.iter()) {
-        assert!(e_1 - e_2 < epsilon);
+        assert!((e_1 - e_2) * (e_1 - e_2) < epsilon * epsilon);
       }
     }
   }
