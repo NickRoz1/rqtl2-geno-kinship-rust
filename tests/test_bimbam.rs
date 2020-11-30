@@ -178,7 +178,7 @@ mod tests {
     .unwrap();
 
     let mut geno_reader = rqtl2::bimbam::GenoReader::with_file(input_file).unwrap();
-    let result = geno_reader.calc_kinship(1, snp_pos_file).unwrap();
+    let result = geno_reader.calc_kinship_on_cpu(1, snp_pos_file).unwrap();
 
     let expected = [
       [

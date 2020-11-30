@@ -136,7 +136,7 @@ mod tests {
     let mut geno_parser = rqtl2::rqtl2::GenoParser::new_with_file(f, hab_mapper.clone())
       .expect("Failed to create GenoParser");
 
-    let mut matr = geno_parser.calc_kinship(1).unwrap();
+    let mut matr = geno_parser.calc_kinship_on_cpu(1).unwrap();
     // The values of Kinship matrix are normalized - each value divided by ids
     // number. This is done to revert it to compare with reference non
     // normalized array in assert statement.
