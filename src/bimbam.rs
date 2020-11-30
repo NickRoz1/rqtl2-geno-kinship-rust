@@ -1,4 +1,4 @@
-use crate::util::error::ParsingError;
+use crate::util::error::ProcessingError;
 use crate::util::tokenizers::tokenize_bimbam_or_rqtl2_line;
 use std::fs::File;
 use std::io::BufRead;
@@ -89,7 +89,7 @@ impl GenoReader {
     snp_name_from_snp_pos_iter: &str,
     source: &[u8],
     dest: &mut [f64],
-  ) -> Result<(), ParsingError> {
+  ) -> Result<(), ProcessingError> {
     let mut tokens = tokenize_bimbam_or_rqtl2_line(source);
 
     let line_type = consume_and_check_id_consume_alleles(snp_name_from_snp_pos_iter, &mut tokens)?;
@@ -148,7 +148,7 @@ impl GenoReader {
 
     if tokens.next() != None || parsed_tokens_num != ids_num {
       use bstr::ByteSlice;
-      return Err(ParsingError::from(std::io::Error::new(
+      return Err(ProcessingError::from(std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
         format!(
           "Error: buffer length is not equal to the amount of tokens.\n\
@@ -161,16 +161,34 @@ impl GenoReader {
     Ok(())
   }
 
+  pub fn calc_kinship_on_cpu(
+    &mut self,
+    batch_size: usize,
+    snp_pos_file: std::fs::File,
+  ) -> std::io::Result<Vec<(String, Vec<f64>)>> {
+    self.calc_kinship(batch_size, snp_pos_file, false)
+  }
+
+  // @note If GPU is unavailable, the calc_kinship_on_cpu will be used as fallback.
+  pub fn calc_kinship_on_gpu(
+    &mut self,
+    batch_size: usize,
+    snp_pos_file: std::fs::File,
+  ) -> std::io::Result<Vec<(String, Vec<f64>)>> {
+    self.calc_kinship(batch_size, snp_pos_file, true)
+  }
+
   /// @brief Calculates LOCO Kinship matrix for every chromosome.
   ///
   /// @note This function assumes that the SNP ids in both <Mean Genotype File
   /// Format> and <SNP Location File Format> are going in the same order and
   /// there is exactly one position entry for one geno entry. It also assumes
   /// that the SNP ids are sorted in the chromosome order.
-  pub fn calc_kinship(
+  fn calc_kinship(
     &mut self,
     batch_size: usize,
     snp_pos_file: std::fs::File,
+    on_gpu: bool,
   ) -> std::io::Result<Vec<(String, Vec<f64>)>> {
     if batch_size < 1 {
       panic!("Batch size can't be less than 1.");
@@ -210,7 +228,7 @@ impl GenoReader {
     let mut cur_chr_total_snps_parsed: usize = 0;
     let mut cur_snp_idx = 0;
 
-    let kinship_merger_delegate = |work_unit: &mut WorkUnit| -> Result<bool, ParsingError> {
+    let mut kinship_merger_delegate = |work_unit: &mut WorkUnit| -> Result<bool, ProcessingError> {
       // Merge results and restore result buffer.
       let merge_into = |chr_kinship_matrix: &mut Vec<f64>| {
         work_unit
@@ -219,7 +237,6 @@ impl GenoReader {
           .zip(chr_kinship_matrix.iter_mut())
           .for_each(|(buf_elem, matrix_elem)| *matrix_elem += *buf_elem);
       };
-
       // LOCO
       for (i, res_matrix) in chrs_kinship_matrices.iter_mut().enumerate() {
         if i != work_unit.chr_num {
@@ -282,7 +299,7 @@ impl GenoReader {
 
           // Check if EOF is reached
           if self.file_reader.read_line(&mut str_buf)? != 0 {
-            return Err(ParsingError::from(err_not_enough_snps));
+            return Err(ProcessingError::from(err_not_enough_snps));
           }
           return Ok(true);
         }
@@ -307,7 +324,7 @@ impl GenoReader {
       cur_chr_total_snps_parsed += line_count;
 
       if line_count < snp_batch_on_chr.len() {
-        return Err(ParsingError::from(std::io::Error::new(
+        return Err(ProcessingError::from(std::io::Error::new(
           std::io::ErrorKind::InvalidInput,
           "Error: BIMBAM Mean Genotype File Format file\
             has fewer records than SNP Location File Format file does.\n",
@@ -338,8 +355,17 @@ impl GenoReader {
     };
 
     use crate::util::kinship::calc_kinship_parallel;
-    calc_kinship_parallel(kinship_merger_delegate, buf_size, ids_num)
-      .expect("Parallel processing failed.");
+    if let Err(e) = calc_kinship_parallel(&mut kinship_merger_delegate, buf_size, ids_num, on_gpu) {
+      match e {
+        ProcessingError::GPUerror(ref err) => {
+          eprintln!("Unable to perform calculation on GPU: {}", err);
+          eprintln!("Calculation will be carried on CPU instead.");
+          calc_kinship_parallel(&mut kinship_merger_delegate, buf_size, ids_num, false)
+            .expect("Parallel processing failed.");
+        }
+        _ => panic!("Parallel processing failed."),
+      };
+    }
 
     let total: usize = chrs_parsed_snps_nums.iter().sum();
 
@@ -413,7 +439,7 @@ impl<'a> Iterator for GenoReaderIter<'a> {
     // Dump old data
     self.read_buf.clear();
 
-    let on_err = |it: &mut Self, e: ParsingError| {
+    let on_err = |it: &mut Self, e: ProcessingError| {
       eprintln!("Failed to parse line. Parsing next line... Error: <{}>", e);
       it.next()
     };
@@ -425,7 +451,7 @@ impl<'a> Iterator for GenoReaderIter<'a> {
           return None;
         }
       }
-      Err(e) => return on_err(self, ParsingError::Io(e)),
+      Err(e) => return on_err(self, ProcessingError::Io(e)),
     };
 
     match parse_geno_line(&self.read_buf) {
@@ -461,7 +487,7 @@ impl<'a> Iterator for GenoReaderIter<'a> {
 /// @in line full line from file, e.g. "rs1, A, T, 0.02"
 ///
 /// @note https://www.haplotype.org/download/bimbam-manual.pdf
-pub fn parse_geno_line(line: &[u8]) -> Result<Option<MeanGenoLine>, ParsingError> {
+pub fn parse_geno_line(line: &[u8]) -> Result<Option<MeanGenoLine>, ProcessingError> {
   let mut tokens = tokenize_bimbam_or_rqtl2_line(line);
 
   let (snp_id, alleles_types) = match parse_id_and_alleles(&mut tokens)? {
@@ -475,7 +501,7 @@ pub fn parse_geno_line(line: &[u8]) -> Result<Option<MeanGenoLine>, ParsingError
     .collect::<Result<Vec<f64>, _>>()?;
   if mean_genos.is_empty() {
     use bstr::ByteSlice;
-    return Err(ParsingError::from(std::io::Error::new(
+    return Err(ProcessingError::from(std::io::Error::new(
       std::io::ErrorKind::InvalidInput,
       format!(
         "BIMBAM Mean Genotype File Format file\n\
@@ -537,7 +563,7 @@ pub fn check_is_empty_or_comment<'a>(tokens: &mut impl Iterator<Item = &'a [u8]>
 fn consume_and_check_id_consume_alleles<'a>(
   expected_snp_id: &str,
   tokens: &mut impl Iterator<Item = &'a [u8]>,
-) -> Result<LineType, ParsingError> {
+) -> Result<LineType, ProcessingError> {
   let first_token = match tokens.next() {
     Some(token_str) => token_str,
     // Empty line
@@ -559,7 +585,7 @@ fn consume_and_check_id_consume_alleles<'a>(
 
   use bstr::ByteSlice;
   if first_token.to_str_lossy() != expected_snp_id {
-    return Err(ParsingError::from(wrong_order_err()));
+    return Err(ProcessingError::from(wrong_order_err()));
   }
 
   let no_alleles_types_err = || {
@@ -581,7 +607,7 @@ fn consume_and_check_id_consume_alleles<'a>(
 /// Genotype File Format file line.
 fn parse_id_and_alleles<'a>(
   tokens: &mut impl Iterator<Item = &'a [u8]>,
-) -> Result<Option<SNPAndAllelesTypes>, ParsingError> {
+) -> Result<Option<SNPAndAllelesTypes>, ProcessingError> {
   let snp_id = match extract_snp_if_not_empty_or_comment(tokens) {
     Some(snp_id_str) => snp_id_str,
     // Empty line
@@ -703,7 +729,7 @@ impl Iterator for SnpPosIter {
     // Dump old data
     self.read_buf.clear();
 
-    let on_err = |it: &mut Self, e: ParsingError| {
+    let on_err = |it: &mut Self, e: ProcessingError| {
       eprintln!("Failed to parse line. Parsing next line... Error: <{}>", e);
       it.next()
     };
@@ -715,7 +741,7 @@ impl Iterator for SnpPosIter {
           return None;
         }
       }
-      Err(e) => return on_err(self, ParsingError::Io(e)),
+      Err(e) => return on_err(self, ProcessingError::Io(e)),
     };
 
     let err_msg = |line: &str| {

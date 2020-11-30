@@ -2,6 +2,8 @@
 name = "kinship_matrix"
 version = "0.1.0"
 authors = ["nickroz"]
+build = "build.rs"
+links = "cublas"
 edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -11,9 +13,17 @@ name = "rqtl2"
 path = "src/lib.rs"
 
 [dependencies]
+libc = "0.2.80"
 num_cpus = "1.13.0"
 bstr = "0.2.14"
 criterion = "0.3"
+libloading = "0.6"
+
+[build-dependencies]
+cc = "1.0"
+
+[features]
+elapsed = []
 
 [[bin]]
 name = "test_lib"

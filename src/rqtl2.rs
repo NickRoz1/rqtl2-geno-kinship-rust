@@ -1,4 +1,4 @@
-use crate::util::error::ParsingError;
+use crate::util::error::ProcessingError;
 use crate::util::tokenizers::tokenize_bimbam_or_rqtl2_line;
 use std::collections::HashMap;
 use std::fs::File;
@@ -77,7 +77,7 @@ impl GenoParser {
     source: &[u8],
     parsed_snp_buf: &mut [f64],
     hab_mapper: &HashMap<char, f64>,
-  ) -> Result<(), ParsingError> {
+  ) -> Result<(), ProcessingError> {
     let mut tokens = tokenize_bimbam_or_rqtl2_line(source);
     use bstr::ByteSlice;
     let snp = tokens.nth(1).ok_or_else(|| {
@@ -87,7 +87,7 @@ impl GenoParser {
       )
     })?;
     if parsed_snp_buf.len() != snp.len() {
-      return Err(ParsingError::from(io_err(
+      return Err(ProcessingError::from(io_err(
         source.to_str().unwrap(),
         &format!(
           "Invalid record: there are {} markers, however {} SNPs were parsed.",
@@ -107,10 +107,19 @@ impl GenoParser {
     Ok(())
   }
 
+  pub fn calc_kinship_on_cpu(&mut self, batch_size: usize) -> Result<Vec<f64>, ProcessingError> {
+    self.calc_kinship(batch_size, false)
+  }
+
+  // @note If GPU is unavailable, the calc_kinship_on_cpu will be used as fallback.
+  pub fn calc_kinship_on_gpu(&mut self, batch_size: usize) -> Result<Vec<f64>, ProcessingError> {
+    self.calc_kinship(batch_size, true)
+  }
+
   /// @brief Calculates kinship matrix for given geno data reading it in
   /// batches. The amount of buffer, so as memory consumption, depends on the
   /// amount of logical cores on the machine and amount of snps.
-  pub fn calc_kinship(&mut self, batch_size: usize) -> Result<Vec<f64>, ParsingError> {
+  fn calc_kinship(&mut self, batch_size: usize, on_gpu: bool) -> Result<Vec<f64>, ProcessingError> {
     if batch_size < 1 {
       panic!("Batch size can't be less than 1.");
     }
@@ -126,7 +135,7 @@ impl GenoParser {
     let hab_mapper = self.hab_mapper.clone();
 
     use crate::util::kinship::WorkUnit;
-    let kinship_merger_delegate = |work_unit: &mut WorkUnit| -> Result<bool, ParsingError> {
+    let mut kinship_merger_delegate = |work_unit: &mut WorkUnit| -> Result<bool, ProcessingError> {
       // Merge results and restore result buffer.
       for (buf_elem, common_matrix_elem) in work_unit
         .result_buf
@@ -159,8 +168,17 @@ impl GenoParser {
     };
 
     use crate::util::kinship::calc_kinship_parallel;
-    calc_kinship_parallel(kinship_merger_delegate, buf_size, ids_num)
-      .expect("Parallel processing failed.");
+    if let Err(e) = calc_kinship_parallel(&mut kinship_merger_delegate, buf_size, ids_num, on_gpu) {
+      match e {
+        ProcessingError::GPUerror(ref err) => {
+          eprintln!("Unable to perform calculation on GPU: {}", err);
+          eprintln!("Calculation will be carried on CPU instead.");
+          calc_kinship_parallel(&mut kinship_merger_delegate, buf_size, ids_num, false)
+            .expect("Parallel processing failed.");
+        }
+        _ => panic!("Parallel processing failed."),
+      };
+    }
 
     assert!(
       total_snps_read >= ids_num,

@@ -82,7 +82,7 @@ mod tests {
     let expected_err = std::io::ErrorKind::InvalidInput;
 
     let check_err = |error_line: &[u8]| {
-      if let Err(rqtl2::util::error::ParsingError::Io(err)) = parse_geno_line(error_line) {
+      if let Err(rqtl2::util::error::ProcessingError::Io(err)) = parse_geno_line(error_line) {
         assert_eq!(err.kind(), expected_err);
       }
     };

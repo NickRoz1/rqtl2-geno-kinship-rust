@@ -4,11 +4,16 @@
 // @brief Unit of work when processing geno file in parallel (calculating
 // Kinship matrix).
 // @note Gets dispatched to a thread.
+#[derive(Debug)]
 pub struct WorkUnit {
   pub sender: std::sync::mpsc::Sender<WorkUnit>,
   pub input_buf: Vec<f64>,
   pub result_buf: Vec<f64>,
   pub chr_num: usize,
+}
+
+extern "C" {
+  pub fn check_gpu_device_availability() -> bool;
 }
 
 /// @brief Calculates Kinship matrix in parallel. Uses <processor> delegate to
@@ -78,12 +83,39 @@ pub struct WorkUnit {
 /// causes recv to error, terminating the dispatching loop, finishing the
 /// geno file processing.
 pub fn calc_kinship_parallel(
-  mut processor: impl FnMut(&mut WorkUnit) -> super::error::Result<bool>,
+  processor: &mut impl FnMut(&mut WorkUnit) -> super::error::Result<bool>,
   read_buf_size: usize,
   ids_num: usize,
-) -> Result<(), super::error::ParsingError> {
-  // For each physical thread a buffers will be created.
-  let buf_num = num_cpus::get();
+  on_gpu: bool,
+) -> Result<(), super::error::ProcessingError> {
+  let buf_num = if on_gpu {
+    // Check if library is present on a machine
+    let check_lib_load = |lib_name: &str| {
+      extern crate libloading as lib;
+      if let Err(e) = lib::Library::new(lib_name) {
+        return Err(super::error::ProcessingError::from(
+          super::error::GPUerror::from(e),
+        ));
+      }
+      Ok(())
+    };
+    check_lib_load("libcudart.so")?;
+    check_lib_load("libcublas.so")?;
+
+    unsafe {
+      if !check_gpu_device_availability() {
+        return Err(super::error::ProcessingError::from(
+          super::error::GPUerror::NoDevice,
+        ));
+      }
+    }
+    // The GPU calculations requires CUDA context initialization for each thread,
+    // too much threads may slow down the program.
+    std::cmp::min(num_cpus::get(), 10)
+  } else {
+    // For each physical thread a buffers will be created.
+    num_cpus::get()
+  };
   use std::sync::mpsc::channel;
   use std::thread;
 
@@ -108,7 +140,12 @@ pub fn calc_kinship_parallel(
 
     threads.push(std::thread::spawn(move || {
       while let Ok(mut work_unit) = worker_thread_consumer.recv() {
-        calc_partial_kinship(&work_unit.input_buf, &mut work_unit.result_buf, ids_num);
+        if on_gpu {
+          calc_partial_kinship_cublas(&work_unit.input_buf, &mut work_unit.result_buf);
+        } else {
+          calc_partial_kinship(&work_unit.input_buf, &mut work_unit.result_buf);
+        }
+
         worker_thread_sender_clone.send(work_unit).unwrap();
       }
       // Worker thread terminates.
@@ -121,7 +158,8 @@ pub fn calc_kinship_parallel(
   drop(worker_thread_sender);
 
   while let Ok(mut work_unit) = main_thread_consumer.recv() {
-    let is_eof_reached = processor(&mut work_unit)?;
+    let res = processor(&mut work_unit);
+    let is_eof_reached = res?;
     // Continue consuming work unit queue until every thread is finished.
     if is_eof_reached {
       continue;
@@ -138,7 +176,14 @@ pub fn calc_kinship_parallel(
   Ok(())
 }
 
-fn calc_partial_kinship(snps: &[f64], partial_matrix: &mut Vec<f64>, ids_num: usize) {
+fn calc_ids_num(kinship_matrix: &mut [f64]) -> usize {
+  // Kinship matrix is square.
+  (kinship_matrix.len() as f64).sqrt() as usize
+}
+
+#[allow(dead_code)]
+fn calc_partial_kinship(snps: &[f64], partial_matrix: &mut Vec<f64>) {
+  let ids_num = calc_ids_num(partial_matrix);
   let n = ids_num;
   let k = snps.len() / n;
   // Algorithm from BLAS dsyrk:
@@ -167,6 +212,10 @@ fn calc_partial_kinship(snps: &[f64], partial_matrix: &mut Vec<f64>, ids_num: us
   // column index j, here, since this is a direct copy of Fortran code which
   // is a colum-major language, we flatten it as column index j *
   // column height + row index i.
+  #[cfg(feature = "elapsed")]
+  use std::time::Instant;
+  #[cfg(feature = "elapsed")]
+  let now = Instant::now();
   for j in 0..n {
     for l in 0..k {
       for i in j..n {
@@ -174,6 +223,45 @@ fn calc_partial_kinship(snps: &[f64], partial_matrix: &mut Vec<f64>, ids_num: us
       }
     }
   }
+  #[cfg(feature = "elapsed")]
+  eprintln!("TIME ELAPSED IN RUST ON CPU: {}", now.elapsed().as_micros());
+}
+
+extern crate libc;
+use libc::{c_double, c_void};
+extern "C" {
+  fn call_cublas_dsyrk(
+    snps: *const c_double,
+    res: *mut c_double,
+    ids_num: u64,
+    row_count: u64,
+  ) -> c_void;
+}
+
+#[allow(dead_code)]
+pub fn calc_partial_kinship_cublas(snps: &[f64], partial_matrix: &mut [f64]) {
+  let ids_num = calc_ids_num(partial_matrix);
+  let row_count = snps.len() / ids_num;
+  #[cfg(feature = "elapsed")]
+  use std::time::Instant;
+  #[cfg(feature = "elapsed")]
+  let now = Instant::now();
+  unsafe {
+    // The DSYRK is perfromed with options: UPLO=L, TRANS=N.
+    // https://www.netlib.org/lapack/explore-html/d1/d54/group__double__blas__level3_gae0ba56279ae3fa27c75fefbc4cc73ddf.html
+    //
+    // This parameters are chosen based on the cblas code, which lets user
+    // choose which kind of memory layot his arrays are. See comments inside
+    // calc_partial_kinship for more clarifications.
+    call_cublas_dsyrk(
+      snps.as_ptr(),
+      partial_matrix.as_mut_ptr(),
+      ids_num as u64,
+      row_count as u64,
+    );
+  }
+  #[cfg(feature = "elapsed")]
+  eprintln!("TIME ELAPSED IN RUST ON GPU: {}", now.elapsed().as_micros());
 }
 
 /// @brief Fills preallocated buffer with parsed values.
